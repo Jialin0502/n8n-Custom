@@ -406,6 +406,97 @@ def strip_telemetry_sdk(root, dry, backup):
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# 5c) --strip-deps: 清除 telemetry/posthog 之外其它文件里对两个 SDK 包的 import
+#     (例如 services/hooks.service.ts 的 `import RudderStack, { type
+#      constructorOptions } from '@rudderstack/rudder-sdk-node'`)。
+#     做法: 把 import 行整体替换为本地 stub —— default/namespace 绑定生成
+#     `type X = any` + 可 new 且运行时 no-op 的 `const X`(Proxy), named 绑定
+#     生成 `type N = any`。这样既能当类型又能 `new`, 且被调用也不抛错。
+#     全仓库扫描确保不漏任何引用点(跨版本面向未来)。
+# ──────────────────────────────────────────────────────────────────────────
+SDK_PKGS = ["@rudderstack/rudder-sdk-node", "posthog-node"]
+_SDK_HANDLED = {  # 已由专门函数处理(含 init 清空), 这里跳过
+    "packages/cli/src/telemetry/index.ts",
+    "packages/cli/src/posthog/index.ts",
+}
+
+
+def _sdk_stub_for_import(clause):
+    """根据 import 子句生成等价的本地 any-stub 声明块。"""
+    off = "/* eslint-disable @typescript-eslint/no-explicit-any */"
+    on = "/* eslint-enable @typescript-eslint/no-explicit-any */"
+    lines = [f"/* {MARK}: SDK stripped */", off]
+    clause = clause.strip()
+    type_only = clause.startswith("type ")
+    if type_only:
+        clause = clause[len("type "):].strip()
+    named = None
+    nm = re.search(r"\{([^}]*)\}", clause)
+    if nm:
+        named = nm.group(1)
+        head = clause[:nm.start()].rstrip().rstrip(",").strip()
+    else:
+        head = clause
+    default_name = ns_name = None
+    if head:
+        if head.startswith("* as"):
+            ns_name = head[len("* as"):].strip()
+        else:
+            default_name = head.strip()
+    proxy_val = ("class { constructor() { "
+                 "return new Proxy(this, { get: () => () => {} }); } } as any")
+    if default_name:
+        lines.append(f"type {default_name} = any;")
+        if not type_only:
+            lines.append(f"const {default_name} = {proxy_val};")
+    if ns_name:
+        lines.append(f"type {ns_name} = any;")
+        if not type_only:
+            lines.append(f"const {ns_name} = new Proxy({{}}, {{ get: () => () => {{}} }}) as any;")
+    if named:
+        for n in named.split(","):
+            n = n.replace("type ", "").strip()
+            if " as " in n:
+                n = n.split(" as ")[1].strip()
+            if n:
+                lines.append(f"type {n} = any;")
+    lines.append(on)
+    return "\n".join(lines)
+
+
+def strip_residual_sdk_imports(root, dry, backup):
+    pkgs_dir = os.path.join(root, "packages")
+    if not os.path.isdir(pkgs_dir):
+        return
+    found = False
+    for dirpath, dirs, files in os.walk(pkgs_dir):
+        dirs[:] = [d for d in dirs if d not in ("node_modules", "dist", ".turbo")]
+        for fn in files:
+            if not fn.endswith(".ts") or ".test." in fn or ".spec." in fn:
+                continue
+            path = os.path.join(dirpath, fn)
+            rel = os.path.relpath(path, root).replace("\\", "/")
+            if rel in _SDK_HANDLED:
+                continue
+            s = read(path)
+            if not any(f"'{p}'" in s for p in SDK_PKGS):
+                continue
+            if f"{MARK}: SDK stripped" in s:
+                log("SKIP", f"{rel}: SDK import 已清除")
+                continue
+            orig = s
+            for pkg in SDK_PKGS:
+                pat = re.compile(rf"import\s+([^;]+?)\s+from\s+'{re.escape(pkg)}';")
+                s = pat.sub(lambda m: _sdk_stub_for_import(m.group(1)), s)
+            if s != orig:
+                write(path, s, dry, backup)
+                found = True
+                log("OK", f"{rel}: 替换 SDK import 为本地 stub")
+    if not found:
+        log("SKIP", "telemetry/posthog 之外无残留 SDK import")
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # 6) 前端: 物理中和 posthog.init.js
 # ──────────────────────────────────────────────────────────────────────────
 def patch_frontend_posthog(root, dry, backup):
@@ -518,6 +609,20 @@ def verify(root):
                 pj = read(pkg2)
                 checks.append(("cli/package.json 已删 RudderStack+posthog-node 依赖",
                                "@rudderstack/rudder-sdk-node" not in pj and "posthog-node" not in pj))
+            # 全仓库扫描: 确保没有任何源码文件仍 import 这两个 SDK 包
+            residual = []
+            pkgs_dir = os.path.join(root, "packages")
+            for dp, ds, fls in os.walk(pkgs_dir):
+                ds[:] = [d for d in ds if d not in ("node_modules", "dist", ".turbo")]
+                for fn in fls:
+                    if not fn.endswith(".ts") or ".test." in fn or ".spec." in fn:
+                        continue
+                    fp = os.path.join(dp, fn)
+                    c = read(fp)
+                    if "from '@rudderstack/rudder-sdk-node'" in c or "from 'posthog-node'" in c:
+                        residual.append(os.path.relpath(fp, root))
+            checks.append((f"全仓库无残留 SDK import (扫描到 {len(residual)} 处)" +
+                           (": " + ", ".join(residual) if residual else ""), not residual))
 
     fe = find_one(root, "packages/frontend/editor-ui/public/static/posthog.init.js")
     if fe:
@@ -569,7 +674,8 @@ def main():
     # 后端遥测
     patch_diagnostics_default(root, dry, backup)
     if args.strip_deps:
-        strip_telemetry_sdk(root, dry, backup)  # 物理移除 SDK
+        strip_telemetry_sdk(root, dry, backup)  # telemetry/posthog: 物理移除 SDK + 清空 init
+        strip_residual_sdk_imports(root, dry, backup)  # 其它文件(hooks.service.ts 等)残留 import
     else:
         inject_init_return(root, ["packages/cli/src/telemetry/index.ts"], "Telemetry", dry, backup)
         inject_init_return(root, ["packages/cli/src/posthog/index.ts"], "PostHogClient", dry, backup)

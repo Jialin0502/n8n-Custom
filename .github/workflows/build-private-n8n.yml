@@ -33,6 +33,17 @@ concurrency:
 env:
   NODE_VERSION: "24.16.0"
   PNPM_VERSION: "10.32.1"
+  # ── 构建期遥测 / 通知 / 非必要下载 统一关闭 ──
+  CI: "true"                              # 让脚本走 CI 分支 (prepare.mjs 跳过 lefthook 等)
+  TURBO_TELEMETRY_DISABLED: "1"           # Turborepo 匿名使用遥测 (就是那条 Attention 提示)
+  DO_NOT_TRACK: "1"                       # 行业通用 opt-out, Turbo 等多种工具识别
+  NEXT_TELEMETRY_DISABLED: "1"            # 兜底 (本仓库非 Next.js, 无害)
+  NO_UPDATE_NOTIFIER: "1"                 # 禁用 update-notifier 类 "有新版" 提示
+  COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"    # corepack 拉包管理器时不交互提示
+  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"   # 不下载 playwright 浏览器二进制
+  PUPPETEER_SKIP_DOWNLOAD: "1"            # 不下载 puppeteer chromium
+  # 注意: 不设置 SENTRY_AUTH_TOKEN => @sentry/vite-plugin 不上传 sourcemap
+  #       (该插件在 n8n 里已配置 telemetry:false, 且无 token 时直接跳过上传)
 
 jobs:
   build:
@@ -45,34 +56,53 @@ jobs:
         with:
           path: tooling
 
-      # 2) 解析目标版本: 输入为空则取最新稳定 n8n@ 语义 tag
-      - name: Resolve target tag
+      # 2) 解析目标 ref:
+      #    - 指定了 version -> n8n@<version>
+      #    - 留空 -> GitHub "Latest" release (API 自动排除 pre-release/draft);
+      #             取不到则回退 n8n 官方稳定指针 tag `stable`
+      #    (不再用 "最大语义 tag", 否则会误选 2.26.x 这类 pre-release)
+      - name: Resolve target ref
         id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           INPUT="${{ inputs.version }}"
-          if [ -z "$INPUT" ]; then
-            TAG=$(git ls-remote --tags --refs https://github.com/n8n-io/n8n.git \
-              | grep -oE 'refs/tags/n8n@[0-9]+\.[0-9]+\.[0-9]+$' \
-              | sed 's|refs/tags/||' | sort -V | tail -1)
-            [ -n "$TAG" ] || { echo "::error::无法解析最新稳定 tag"; exit 1; }
-          else
+          if [ -n "$INPUT" ]; then
             case "$INPUT" in
-              n8n@*) TAG="$INPUT" ;;
-              *)     TAG="n8n@${INPUT#v}" ;;
+              n8n@*) REF="$INPUT" ;;
+              *)     REF="n8n@${INPUT#v}" ;;
             esac
+          else
+            REF=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+                  -H "Accept: application/vnd.github+json" \
+                  https://api.github.com/repos/n8n-io/n8n/releases/latest 2>/dev/null \
+                  | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"' \
+                  | grep -oE 'n8n@[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+            if [ -z "$REF" ]; then
+              echo "::warning::releases/latest 解析失败, 回退到 stable tag"
+              REF="stable"
+            fi
           fi
-          VERSION="${TAG#n8n@}"
-          echo "tag=$TAG"           >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION"   >> "$GITHUB_OUTPUT"
-          echo "::notice::目标版本 $TAG"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "::notice::目标 ref = $REF"
 
-      # 3) 浅克隆 n8n 指定 tag
-      - name: Clone n8n @ ${{ steps.resolve.outputs.tag }}
+      # 3) 浅克隆 n8n 指定 ref
+      - name: Clone n8n @ ${{ steps.resolve.outputs.ref }}
         run: |
           set -euo pipefail
-          git clone --depth 1 --branch "${{ steps.resolve.outputs.tag }}" \
+          git clone --depth 1 --branch "${{ steps.resolve.outputs.ref }}" \
             https://github.com/n8n-io/n8n.git n8n
+
+      # 3b) 从源码读真实版本号 (stable/latest 是浮动指针, 需读 package.json)
+      - name: Read resolved version
+        id: ver
+        run: |
+          set -euo pipefail
+          V=$(grep -m1 '"version"' n8n/package.json | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          [ -n "$V" ] || { echo "::error::读取版本失败"; exit 1; }
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "::notice::解析到版本 $V"
 
       # 4) 应用隐私 patch (去遥测 + License 内联 Community Plus + 去邮箱)
       - name: Setup Python
@@ -106,9 +136,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ steps.pnpm.outputs.store }}
-          key: pnpm-${{ runner.os }}-${{ steps.resolve.outputs.version }}-${{ hashFiles('n8n/pnpm-lock.yaml') }}
+          key: pnpm-${{ runner.os }}-${{ steps.ver.outputs.version }}-${{ hashFiles('n8n/pnpm-lock.yaml') }}
           restore-keys: |
-            pnpm-${{ runner.os }}-${{ steps.resolve.outputs.version }}-
+            pnpm-${{ runner.os }}-${{ steps.ver.outputs.version }}-
             pnpm-${{ runner.os }}-
 
       # 7) 缓存: turbo 构建产物 (跨版本复用, 仅命中未变的包)
@@ -117,9 +147,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: n8n/.turbo
-          key: turbo-${{ runner.os }}-${{ steps.resolve.outputs.version }}-${{ github.run_id }}
+          key: turbo-${{ runner.os }}-${{ steps.ver.outputs.version }}-${{ github.run_id }}
           restore-keys: |
-            turbo-${{ runner.os }}-${{ steps.resolve.outputs.version }}-
+            turbo-${{ runner.os }}-${{ steps.ver.outputs.version }}-
             turbo-${{ runner.os }}-
 
       # 8) 安装 (改了 package.json, 必须 --no-frozen-lockfile 以更新 lockfile;
@@ -132,7 +162,6 @@ jobs:
       - name: Build n8n
         working-directory: n8n
         env:
-          CI: "true"
           NODE_OPTIONS: "--max-old-space-size=6144"
         run: pnpm build:n8n
 
@@ -145,9 +174,9 @@ jobs:
           context: n8n
           file: n8n/docker/images/n8n/Dockerfile
           build-args: |
-            N8N_VERSION=${{ steps.resolve.outputs.version }}
+            N8N_VERSION=${{ steps.ver.outputs.version }}
             N8N_RELEASE_TYPE=stable
-          tags: n8n-private:${{ steps.resolve.outputs.version }}
+          tags: n8n-private:${{ steps.ver.outputs.version }}
           load: true
           cache-from: type=gha,scope=n8n-image
           cache-to: type=gha,mode=max,scope=n8n-image
@@ -156,14 +185,14 @@ jobs:
       - name: Export image
         run: |
           set -euo pipefail
-          OUT="n8n-private-${{ steps.resolve.outputs.version }}.tar"
-          docker save "n8n-private:${{ steps.resolve.outputs.version }}" -o "$OUT"
+          OUT="n8n-private-${{ steps.ver.outputs.version }}.tar"
+          docker save "n8n-private:${{ steps.ver.outputs.version }}" -o "$OUT"
           gzip -9 "$OUT"
           ls -lh "${OUT}.gz"
       - name: Upload image artifact
         uses: actions/upload-artifact@v4
         with:
-          name: n8n-private-${{ steps.resolve.outputs.version }}
-          path: n8n-private-${{ steps.resolve.outputs.version }}.tar.gz
+          name: n8n-private-${{ steps.ver.outputs.version }}
+          path: n8n-private-${{ steps.ver.outputs.version }}.tar.gz
           retention-days: 14
           compression-level: 0  # 已 gzip, 不重复压缩
