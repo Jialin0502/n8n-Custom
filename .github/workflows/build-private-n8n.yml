@@ -165,7 +165,12 @@ jobs:
           NODE_OPTIONS: "--max-old-space-size=6144"
         run: pnpm build:n8n
 
-      # 10) docker buildx + GHA layer 缓存 (跨版本复用 base/系统层)
+      # 10) 清掉会被打进镜像的构建元数据 (compiled/build-manifest.json:
+      #     含 buildTime/artifactSize 等; 非 env 隐私, 但属构建痕迹, 一并去掉)
+      - name: Strip in-image build metadata
+        run: rm -f n8n/compiled/build-manifest.json n8n/dist/task-runner-javascript/build-manifest.json 2>/dev/null || true
+
+      # 11) docker buildx + GHA layer 缓存 (跨版本复用 base/系统层)
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Build image
@@ -178,6 +183,10 @@ jobs:
             N8N_RELEASE_TYPE=stable
           tags: n8n-private:${{ steps.ver.outputs.version }}
           load: true
+          # ── 关闭会泄露构建环境的镜像元数据 ──
+          provenance: false   # 不生成 SLSA provenance attestation
+          # (否则会写入仓库名/runner 路径/actor/commit/build-args 等)
+          sbom: false         # 不生成 SBOM attestation
           cache-from: type=gha,scope=n8n-image
           cache-to: type=gha,mode=max,scope=n8n-image
 
