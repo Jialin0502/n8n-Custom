@@ -1,0 +1,169 @@
+name: Build private n8n (de-telemetry + Community Plus)
+
+# 自用构建流水线:
+#   - 手动触发, 可指定 n8n 标签版本, 留空则自动取最新稳定版 (n8n@X.Y.Z 中的最大语义版本);
+#   - 拉取源码 -> 应用 n8n-privacy-patch.py -> pnpm 构建 -> 打成 docker 镜像 -> 上传为产物供下载;
+#   - 带 pnpm store / turbo / docker layer 三级缓存, 用 restore-keys 模糊匹配尽量跨版本复用。
+#
+# 约定: 把 n8n-privacy-patch.py 放在本仓库根目录 (与本 workflow 同仓库)。
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "n8n 标签 (如 2.25.7 或 n8n@2.25.7); 留空 = 自动取最新稳定版"
+        required: false
+        default: ""
+      strip_deps:
+        description: "物理移除遥测 SDK 依赖与引用 (--strip-deps); 关闭则仅中和"
+        type: boolean
+        default: true
+      no_cache:
+        description: "禁用缓存 (排障用)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-private-n8n-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: "24.16.0"
+  PNPM_VERSION: "10.32.1"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      # 1) 取出本仓库 (含 patch 脚本) 到 tooling/
+      - name: Checkout tooling (patch script)
+        uses: actions/checkout@v4
+        with:
+          path: tooling
+
+      # 2) 解析目标版本: 输入为空则取最新稳定 n8n@ 语义 tag
+      - name: Resolve target tag
+        id: resolve
+        run: |
+          set -euo pipefail
+          INPUT="${{ inputs.version }}"
+          if [ -z "$INPUT" ]; then
+            TAG=$(git ls-remote --tags --refs https://github.com/n8n-io/n8n.git \
+              | grep -oE 'refs/tags/n8n@[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sed 's|refs/tags/||' | sort -V | tail -1)
+            [ -n "$TAG" ] || { echo "::error::无法解析最新稳定 tag"; exit 1; }
+          else
+            case "$INPUT" in
+              n8n@*) TAG="$INPUT" ;;
+              *)     TAG="n8n@${INPUT#v}" ;;
+            esac
+          fi
+          VERSION="${TAG#n8n@}"
+          echo "tag=$TAG"           >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION"   >> "$GITHUB_OUTPUT"
+          echo "::notice::目标版本 $TAG"
+
+      # 3) 浅克隆 n8n 指定 tag
+      - name: Clone n8n @ ${{ steps.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${{ steps.resolve.outputs.tag }}" \
+            https://github.com/n8n-io/n8n.git n8n
+
+      # 4) 应用隐私 patch (去遥测 + License 内联 Community Plus + 去邮箱)
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Apply privacy patch
+        run: |
+          set -euo pipefail
+          STRIP=""
+          if [ "${{ inputs.strip_deps }}" = "true" ]; then STRIP="--strip-deps"; fi
+          python3 tooling/n8n-privacy-patch.py n8n $STRIP --verify --no-backup
+
+      # 5) 工具链
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # 6) 缓存: pnpm store (内容寻址, 跨版本复用率高)
+      - name: Get pnpm store path
+        id: pnpm
+        working-directory: n8n
+        run: echo "store=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+      - name: Cache pnpm store
+        if: ${{ !inputs.no_cache }}
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm.outputs.store }}
+          key: pnpm-${{ runner.os }}-${{ steps.resolve.outputs.version }}-${{ hashFiles('n8n/pnpm-lock.yaml') }}
+          restore-keys: |
+            pnpm-${{ runner.os }}-${{ steps.resolve.outputs.version }}-
+            pnpm-${{ runner.os }}-
+
+      # 7) 缓存: turbo 构建产物 (跨版本复用, 仅命中未变的包)
+      - name: Cache turbo
+        if: ${{ !inputs.no_cache }}
+        uses: actions/cache@v4
+        with:
+          path: n8n/.turbo
+          key: turbo-${{ runner.os }}-${{ steps.resolve.outputs.version }}-${{ github.run_id }}
+          restore-keys: |
+            turbo-${{ runner.os }}-${{ steps.resolve.outputs.version }}-
+            turbo-${{ runner.os }}-
+
+      # 8) 安装 (改了 package.json, 必须 --no-frozen-lockfile 以更新 lockfile;
+      #    随后 build-n8n.mjs 内部的 --frozen-lockfile 校验即可通过)
+      - name: pnpm install
+        working-directory: n8n
+        run: pnpm install --no-frozen-lockfile
+
+      # 9) 构建 + 生成 compiled 部署目录 (官方脚本)
+      - name: Build n8n
+        working-directory: n8n
+        env:
+          CI: "true"
+          NODE_OPTIONS: "--max-old-space-size=6144"
+        run: pnpm build:n8n
+
+      # 10) docker buildx + GHA layer 缓存 (跨版本复用 base/系统层)
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: n8n
+          file: n8n/docker/images/n8n/Dockerfile
+          build-args: |
+            N8N_VERSION=${{ steps.resolve.outputs.version }}
+            N8N_RELEASE_TYPE=stable
+          tags: n8n-private:${{ steps.resolve.outputs.version }}
+          load: true
+          cache-from: type=gha,scope=n8n-image
+          cache-to: type=gha,mode=max,scope=n8n-image
+
+      # 11) 导出镜像为压缩 tar 并上传为产物
+      - name: Export image
+        run: |
+          set -euo pipefail
+          OUT="n8n-private-${{ steps.resolve.outputs.version }}.tar"
+          docker save "n8n-private:${{ steps.resolve.outputs.version }}" -o "$OUT"
+          gzip -9 "$OUT"
+          ls -lh "${OUT}.gz"
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: n8n-private-${{ steps.resolve.outputs.version }}
+          path: n8n-private-${{ steps.resolve.outputs.version }}.tar.gz
+          retention-days: 14
+          compression-level: 0  # 已 gzip, 不重复压缩
