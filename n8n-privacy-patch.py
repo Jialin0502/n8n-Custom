@@ -574,7 +574,7 @@ def _default_lang_dir():
 
 def apply_chinese(root, lang_dir, dry, backup):
     lang_dir = lang_dir or _default_lang_dir()
-    zh_src = os.path.join(lang_dir, "locales", "zh-CN.json")
+    zh_src = os.path.join(lang_dir, "zh-CN.json")
     if not os.path.isfile(zh_src):
         log("WARN", f"找不到语言文件 {zh_src}, 跳过中文处理 (用 --lang-dir 指定)")
         return
