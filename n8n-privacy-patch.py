@@ -559,6 +559,135 @@ def patch_frontend_rudder(root, dry, backup):
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# 7) 中文处理: 应用 zh-CN 语言包并补上动态加载机制
+#    官方 n8n 只内置 en, setLanguage 不会加载非英语翻译; 这里:
+#      a) 把独立的 zh-CN.json 放入 i18n/src/locales/;
+#      b) i18n/index.ts 放宽 locale 类型 (as 'en' -> as any);
+#      c) App.vue 补上按 defaultLocale/localStorage 动态 import 语言文件的逻辑;
+#      d) (可选) MainSidebar 的 Insights 标签 i18n 化、附带 menuLocalizationUtils。
+#    之后设 N8N_DEFAULT_LOCALE=zh-CN 即默认中文 (也支持设置页/localStorage 切换)。
+# ──────────────────────────────────────────────────────────────────────────
+def _default_lang_dir():
+    # 默认在脚本同目录下的 n8n-i18n/ 找语言资源
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "n8n-i18n")
+
+
+def apply_chinese(root, lang_dir, dry, backup):
+    lang_dir = lang_dir or _default_lang_dir()
+    zh_src = os.path.join(lang_dir, "locales", "zh-CN.json")
+    if not os.path.isfile(zh_src):
+        log("WARN", f"找不到语言文件 {zh_src}, 跳过中文处理 (用 --lang-dir 指定)")
+        return
+
+    # a) 复制 zh-CN.json 到 i18n locales
+    en = find_one(root,
+                  "packages/frontend/@n8n/i18n/src/locales/en.json",
+                  "packages/frontend/editor-ui/src/plugins/i18n/locales/en.json")
+    if not en:
+        log("WARN", "找不到 i18n locales 目录, 跳过中文处理")
+        return
+    i18n_locales = os.path.dirname(en)
+    zh_dst = os.path.join(i18n_locales, "zh-CN.json")
+    if dry:
+        log("OK", f"[dry-run] 复制 zh-CN.json -> {os.path.relpath(zh_dst, root)}")
+    else:
+        import shutil
+        shutil.copyfile(zh_src, zh_dst)
+        log("OK", f"安装语言包 zh-CN.json -> {os.path.relpath(zh_dst, root)}")
+
+    # b) i18n/index.ts: 放宽 locale 类型
+    idx = find_one(root, "packages/frontend/@n8n/i18n/src/index.ts")
+    if idx:
+        s = read(idx)
+        if "locale.value = locale as 'en'" in s:
+            s = s.replace("i18nInstance.global.locale.value = locale as 'en';",
+                          f"i18nInstance.global.locale.value = locale as any; // {MARK} zh-CN")
+            write(idx, s, dry, backup)
+            log("OK", "i18n/index.ts: 放宽 locale 类型 (as 'en' -> as any)")
+        elif "as any" in s and f"{MARK} zh-CN" in s:
+            log("SKIP", "i18n/index.ts 已放宽 locale 类型")
+        else:
+            log("WARN", "i18n/index.ts 未匹配 locale 类型锚点")
+
+    # c) App.vue: 补动态加载逻辑
+    app = find_one(root, "packages/frontend/editor-ui/src/app/App.vue",
+                   "packages/frontend/editor-ui/src/App.vue")
+    if app:
+        s = read(app)
+        if f"{MARK} zh-CN" in s:
+            log("SKIP", "App.vue 已注入中文动态加载")
+        else:
+            orig = s
+            # c1) import loadLanguage
+            s = s.replace("import { setLanguage } from '@n8n/i18n';",
+                          "import { loadLanguage, setLanguage } from '@n8n/i18n';")
+            # c2) defaultLocale 优先 localStorage
+            s = s.replace(
+                "const defaultLocale = computed(() => rootStore.defaultLocale);",
+                "const defaultLocale = computed(() => {\n"
+                f"\t// {MARK} zh-CN: 优先用 localStorage 保存的语言, 回退到 N8N_DEFAULT_LOCALE\n"
+                "\tconst savedLanguage = localStorage.getItem('n8n-user-language');\n"
+                "\treturn savedLanguage || rootStore.defaultLocale;\n"
+                "});")
+            # c3) onMounted 内初始化已保存语言
+            init_block = (
+                "\n\n\t// {MARK} zh-CN: 启动时加载已保存的语言\n"
+                "\tconst savedLanguage = localStorage.getItem('n8n-user-language');\n"
+                "\tif (savedLanguage && savedLanguage !== 'en') {\n"
+                "\t\ttry {\n"
+                "\t\t\tconst messages = await import(`@n8n/i18n/locales/${savedLanguage}.json`);\n"
+                "\t\t\tloadLanguage(savedLanguage, messages.default);\n"
+                "\t\t\trootStore.setDefaultLocale(savedLanguage);\n"
+                "\t\t} catch (error) {\n"
+                "\t\t\tconsole.warn('Failed to load saved language:', error);\n"
+                "\t\t\tlocalStorage.removeItem('n8n-user-language');\n"
+                "\t\t}\n"
+                "\t}"
+            ).replace("{MARK}", MARK)
+            s = s.replace("onMounted(async () => {\n\tsetAppZIndexes();",
+                          "onMounted(async () => {\n\tsetAppZIndexes();" + init_block)
+            # c4) watch 里 setLanguage 改为动态加载
+            load_block = (
+                "\t\tif (newLocale !== 'en') {\n"
+                "\t\t\ttry {\n"
+                "\t\t\t\tconst messages = await import(`@n8n/i18n/locales/${newLocale}.json`);\n"
+                "\t\t\t\tloadLanguage(newLocale, messages.default);\n"
+                "\t\t\t} catch (error) {\n"
+                "\t\t\t\tconsole.warn(`Failed to load locale ${newLocale}:`, error);\n"
+                "\t\t\t\tsetLanguage('en');\n"
+                "\t\t\t\treturn;\n"
+                "\t\t\t}\n"
+                "\t\t} else {\n"
+                "\t\t\tsetLanguage(newLocale);\n"
+                "\t\t}"
+            )
+            s = s.replace(
+                "\t\tsetLanguage(newLocale);\n\n\t\taxios.defaults.headers.common['Accept-Language'] = newLocale;",
+                load_block + "\n\n\t\taxios.defaults.headers.common['Accept-Language'] = newLocale;")
+            if s != orig and f"{MARK} zh-CN" in s:
+                write(app, s, dry, backup)
+                log("OK", "App.vue: 注入中文动态加载 (defaultLocale/localStorage + 切换)")
+            else:
+                log("WARN", "App.vue 未匹配语言加载锚点 (版本结构可能已变)")
+
+    # d) 可选: MainSidebar 的 Insights 标签 i18n 化 + 附带 menuLocalizationUtils
+    sidebar = find_one(root, "packages/frontend/editor-ui/src/app/components/MainSidebar.vue")
+    if sidebar:
+        s = read(sidebar)
+        if "label: 'Insights'," in s:
+            s = s.replace("label: 'Insights',",
+                          "label: i18n.baseText('mainSidebar.insights') || 'Insights',")
+            write(sidebar, s, dry, backup)
+            log("OK", "MainSidebar.vue: Insights 标签 i18n 化")
+    util_src = os.path.join(lang_dir, "menuLocalizationUtils.ts")
+    util_dir = os.path.join(root, "packages/frontend/editor-ui/src/app/utils")
+    if os.path.isfile(util_src) and os.path.isdir(util_dir) and not dry:
+        import shutil
+        shutil.copyfile(util_src, os.path.join(util_dir, "menuLocalizationUtils.ts"))
+        log("OK", "附带 menuLocalizationUtils.ts")
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # 校验
 # ──────────────────────────────────────────────────────────────────────────
 def verify(root):
@@ -652,6 +781,10 @@ def main():
     ap.add_argument("--verify", action="store_true", help="结束后校验")
     ap.add_argument("--strip-deps", action="store_true",
                     help="物理移除后端遥测 SDK 依赖与引用(更彻底), 而非仅中和 init")
+    ap.add_argument("--chinese", action="store_true",
+                    help="应用 zh-CN 中文语言包并补上动态加载机制")
+    ap.add_argument("--lang-dir", default=None,
+                    help="语言资源目录(含 locales/zh-CN.json), 默认脚本旁的 n8n-i18n/")
     args = ap.parse_args()
 
     root = os.path.abspath(args.root)
@@ -682,6 +815,9 @@ def main():
     # 前端遥测
     patch_frontend_posthog(root, dry, backup)
     patch_frontend_rudder(root, dry, backup)
+    # 中文处理 (可选)
+    if args.chinese:
+        apply_chinese(root, args.lang_dir, dry, backup)
 
     print("\n──────── 汇总 ────────")
     print(f"  应用 {STATS['applied']} / 跳过 {STATS['skipped']} / 警告 {STATS['warned']}")

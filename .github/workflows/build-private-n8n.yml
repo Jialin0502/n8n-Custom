@@ -18,6 +18,10 @@ on:
         description: "物理移除遥测 SDK 依赖与引用 (--strip-deps); 关闭则仅中和"
         type: boolean
         default: true
+      chinese:
+        description: "应用 zh-CN 中文汉化 (需仓库内 tooling/n8n-i18n/ 语言资源)"
+        type: boolean
+        default: true
       no_cache:
         description: "禁用缓存 (排障用)"
         type: boolean
@@ -112,9 +116,10 @@ jobs:
       - name: Apply privacy patch
         run: |
           set -euo pipefail
-          STRIP=""
-          if [ "${{ inputs.strip_deps }}" = "true" ]; then STRIP="--strip-deps"; fi
-          python3 tooling/n8n-privacy-patch.py n8n $STRIP --verify --no-backup
+          ARGS="--verify --no-backup"
+          if [ "${{ inputs.strip_deps }}" = "true" ]; then ARGS="$ARGS --strip-deps"; fi
+          if [ "${{ inputs.chinese }}" = "true" ]; then ARGS="$ARGS --chinese --lang-dir tooling/n8n-i18n"; fi
+          python3 tooling/n8n-privacy-patch.py n8n $ARGS
 
       # 5) 工具链
       - name: Setup pnpm
